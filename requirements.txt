@@ -3,4 +3,3 @@ pandas==2.2.2
 pydeck==0.9.1
 protobuf==5.27.2
 requests==2.32.3
-git+https://github.com/MobilityData/gtfs-realtime-bindings@master#subdirectory=python
