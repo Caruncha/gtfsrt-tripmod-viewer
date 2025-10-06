@@ -1,1 +1,34 @@
 
+# samples/sample_tripmod.textproto
+header {
+  gtfs_realtime_version: "2.0"
+  incrementality: FULL_DATASET
+  timestamp: 1767225600  # 2025-12-31 00:00:00 UTC
+}
+entity {
+  id: "shape-detour-1"
+  shape {
+    # Petit crochet Est autour du segment S2->S3
+    encoded_polyline: "}_p`F|y`_Mo@jBqArCeBxD"
+  }
+}
+entity {
+  id: "tripmod-1"
+  trip_modifications {
+    # Dates où le détour s’applique
+    service_dates: "20251201"
+    service_dates: "20251202"
+
+    # Une 'Modification' qui insère 2 arrêts de remplacement après S2
+    modifications {
+      replacement_stops {
+        stop_id: "R_TMP_1"
+        travel_time_to_stop: 120   # +2 min depuis l'arrêt de référence
+      }
+      replacement_stops {
+        stop_id: "R_TMP_2"
+        travel_time_to_stop: 420   # +7 min depuis l'arrêt de référence
+      }
+    }
+  }
+}
