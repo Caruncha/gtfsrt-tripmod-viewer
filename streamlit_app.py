@@ -1,30 +1,28 @@
 # -*- coding: utf-8 -*-
 import io
+import gzip
 import zipfile
 import streamlit as st
 import pandas as pd
 import pydeck as pdk
 from google.protobuf.message import DecodeError
+from google.protobuf import text_format
 
-# 1) Import du binding GTFS-rt (installé depuis MobilityData dans requirements.txt)
+# 1) Binding GTFS-rt (installé depuis MobilityData via requirements.txt)
+#    => inclut les champs expérimentaux (trip_modifications, shape, stop)
 from google.transit import gtfs_realtime_pb2 as pb
 
-# ---------- GTFS utilitaires ----------
+# ---------- Utilitaires GTFS ----------
 def load_gtfs_zip(gtfs_bytes: bytes) -> dict[str, pd.DataFrame]:
     zf = zipfile.ZipFile(io.BytesIO(gtfs_bytes))
     dfs = {}
     for name in zf.namelist():
         if name.lower().endswith(".txt"):
             with zf.open(name) as f:
-                dfs[name.lower()] = pd.read_csv(f, dtype=str).fillna("")
-    # normaliser clés pour accès simple
-    return {
-        k.split("/")[-1]: v
-        for k, v in dfs.items()
-    }
+                dfs[name.split("/")[-1].lower()] = pd.read_csv(f, dtype=str).fillna("")
+    return dfs
 
 def build_trip_shape(dfs: dict[str, pd.DataFrame], trip_id: str) -> list[tuple[float,float]]:
-    """Retourne la polyligne (lat, lon) du trip depuis shapes.txt si possible, sinon fallback via la chaîne d’arrêts."""
     trips = dfs.get("trips.txt"); stimes = dfs.get("stop_times.txt")
     stops = dfs.get("stops.txt"); shapes = dfs.get("shapes.txt")
     pts: list[tuple[float,float]] = []
@@ -32,18 +30,19 @@ def build_trip_shape(dfs: dict[str, pd.DataFrame], trip_id: str) -> list[tuple[f
     if trips is not None and shapes is not None and "shape_id" in trips.columns:
         trow = trips.loc[trips["trip_id"] == trip_id]
         if not trow.empty:
-            shape_id = trow.iloc[0]["shape_id"]
-            shp = shapes.loc[shapes["shape_id"] == shape_id].copy()
-            if "shape_pt_sequence" in shp.columns:
-                shp["shape_pt_sequence"] = pd.to_numeric(shp["shape_pt_sequence"], errors="coerce")
-                shp = shp.sort_values("shape_pt_sequence")
-            for _, r in shp.iterrows():
-                try:
-                    pts.append((float(r["shape_pt_lat"]), float(r["shape_pt_lon"])))
-                except Exception:
-                    pass
-            if pts:
-                return pts
+            shape_id = trow.iloc[0].get("shape_id", "")
+            if shape_id and shape_id in shapes["shape_id"].values:
+                shp = shapes.loc[shapes["shape_id"] == shape_id].copy()
+                if "shape_pt_sequence" in shp.columns:
+                    shp["shape_pt_sequence"] = pd.to_numeric(shp["shape_pt_sequence"], errors="coerce")
+                    shp = shp.sort_values("shape_pt_sequence")
+                for _, r in shp.iterrows():
+                    try:
+                        pts.append((float(r["shape_pt_lat"]), float(r["shape_pt_lon"])))
+                    except Exception:
+                        pass
+                if pts:
+                    return pts
 
     if stimes is not None and stops is not None:
         s = stimes.loc[stimes["trip_id"] == trip_id].copy()
@@ -79,6 +78,65 @@ def decode_polyline(encoded: str) -> list[tuple[float,float]]:
         coords.append((lat / 1e5, lng / 1e5))
     return coords
 
+# ---------- Parsing robuste du .pb ----------
+def parse_tripmod_feed(raw: bytes) -> tuple[pb.FeedMessage, dict]:
+    """
+    Essaie successivement :
+      1) binaire FeedMessage (avec détection gzip)
+      2) textproto FeedMessage
+      3) binaire TripModifications seul (on l’enveloppe dans un FeedMessage)
+      4) textproto TripModifications seul
+    Retourne (feed, meta) où meta décrit le mode de parsing.
+    """
+    meta = {"gzip": False, "mode": None}
+
+    # GZIP ?
+    if len(raw) >= 2 and raw[0] == 0x1F and raw[1] == 0x8B:
+        raw = gzip.decompress(raw)
+        meta["gzip"] = True
+
+    # 1) FeedMessage binaire
+    try:
+        fm = pb.FeedMessage(); fm.ParseFromString(raw)
+        meta["mode"] = "binary:FeedMessage"
+        return fm, meta
+    except DecodeError:
+        pass
+
+    # 2) FeedMessage textproto
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        fm = pb.FeedMessage()
+        text_format.Parse(text, fm, allow_unknown_extension=True)
+        meta["mode"] = "textproto:FeedMessage"
+        return fm, meta
+    except Exception:
+        pass
+
+    # 3) TripModifications seul (binaire)
+    try:
+        tm = pb.TripModifications(); tm.ParseFromString(raw)
+        fm = pb.FeedMessage()
+        ent = pb.FeedEntity(); ent.id = "tm-1"; ent.trip_modifications.CopyFrom(tm)
+        fm.entity.extend([ent])
+        meta["mode"] = "binary:TripModifications_wrapped"
+        return fm, meta
+    except Exception:
+        pass
+
+    # 4) TripModifications seul (textproto)
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        tm = pb.TripModifications()
+        text_format.Parse(text, tm, allow_unknown_extension=True)
+        fm = pb.FeedMessage()
+        ent = pb.FeedEntity(); ent.id = "tm-1"; ent.trip_modifications.CopyFrom(tm)
+        fm.entity.extend([ent])
+        meta["mode"] = "textproto:TripModifications_wrapped"
+        return fm, meta
+    except Exception as e:
+        raise DecodeError(f"Impossible de parser ce fichier comme GTFS-rt: {e}")
+
 # ---------- UI ----------
 st.set_page_config(page_title="TripModifications • Analyse & Carte", layout="wide")
 st.title("GTFS‑rt TripModifications — Analyse & Visualisation")
@@ -87,40 +145,41 @@ col1, col2 = st.columns(2)
 with col1:
     gtfs_file = st.file_uploader("GTFS statique (.zip)", type=["zip"])
 with col2:
-    rt_file = st.file_uploader("TripModification (.pb)", type=["pb","pbf","bin"])
+    rt_file = st.file_uploader("TripModification (.pb / .pb.gz / .pbtxt)", type=["pb","pbf","bin","pbtxt","txt","textproto","gz"])
 
 if not (gtfs_file and rt_file):
-    st.info("Charge un GTFS (.zip) et un TripModification (.pb) pour commencer.")
+    st.info("Charge un GTFS (.zip) et un TripModification (.pb / .pb.gz / .pbtxt).")
     st.stop()
 
 # Charger GTFS
 dfs = load_gtfs_zip(gtfs_file.read())
+stops_df = dfs.get("stops.txt")
 
-# Charger feed protobuf
-feed = pb.FeedMessage()
+# Charger .pb avec tolérance
+raw = rt_file.read()
 try:
-    feed.ParseFromString(rt_file.read())
+    feed, meta = parse_tripmod_feed(raw)
+    st.caption(f"Décodage : mode={meta['mode']}, gzip={meta['gzip']}")
 except DecodeError as e:
-    st.error("Impossible de décoder le fichier .pb (Protobuf).")
+    st.error("Impossible de décoder le fichier fourni (ni FeedMessage, ni TripModifications).")
     st.exception(e)
     st.stop()
 
-# Extraire les entités
+# Extraire entités utiles
 tripmods = [(e.id, e.trip_modifications) for e in feed.entity if e.HasField("trip_modifications")]
 shapes_rt = [e.shape for e in feed.entity if e.HasField("shape") and getattr(e.shape, "encoded_polyline", "")]
 
 if not tripmods:
-    st.warning("Aucune entité TripModifications trouvée dans ce .pb.")
+    st.warning("Aucune entité TripModifications détectée dans les données décodées.")
     st.stop()
 
 sel = st.selectbox("Choisir une TripModifications", [f"{i+1}. {eid}" for i,(eid,_) in enumerate(tripmods)], index=0)
 tm_idx = int(sel.split(".")[0]) - 1
 eid, tm = tripmods[tm_idx]
 
+# ---------- Analyse ----------
 st.subheader("Analyse")
 issues: list[str] = []
-
-stops_df = dfs.get("stops.txt")
 loc_type = {}
 if stops_df is not None:
     if "location_type" not in stops_df.columns:
@@ -146,24 +205,25 @@ if issues:
 else:
     st.success("Aucun problème détecté (routabilité & monotonicité).")
 
+# ---------- Carte ----------
 st.subheader("Carte des détours")
 
 # Trip de référence (pour shape d’origine)
 trip_id_for_shape = None
 if hasattr(tm, "selected_trips"):
-    for sel in tm.selected_trips:
-        if hasattr(sel, "trip_id") and sel.trip_id:
-            trip_id_for_shape = sel.trip_id
+    for sel_tm in tm.selected_trips:
+        if hasattr(sel_tm, "trip_id") and sel_tm.trip_id:
+            trip_id_for_shape = sel_tm.trip_id
             break
 
 base_line = build_trip_shape(dfs, trip_id_for_shape) if trip_id_for_shape else []
 
-# Détour : privilégier Shape temps réel (encoded polyline)
+# Détour: privilégier Shape temps réel (encoded polyline)
 detour_paths: list[list[tuple[float,float]]] = []
 for sh in shapes_rt:
     detour_paths.append(decode_polyline(sh.encoded_polyline))
 
-# Fallback détour: relier les arrêts temporaires
+# Fallback: relier les arrêts temporaires
 if not detour_paths and stops_df is not None:
     m = stops_df.set_index("stop_id")[["stop_lat","stop_lon"]].to_dict("index")
     path = []
