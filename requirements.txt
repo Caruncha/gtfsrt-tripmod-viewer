@@ -1,0 +1,7 @@
+streamlit==1.37.1
+pandas==2.2.2
+pydeck==0.9.1
+protobuf==5.27.2
+requests==2.32.3
+gtfs-realtime-bindings==1.0.0
+grpcio-tools==1.65.5
